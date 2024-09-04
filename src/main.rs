@@ -2,8 +2,10 @@
 mod codec;
 
 use std::collections::{HashSet, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, IpAddr};
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
@@ -15,100 +17,210 @@ use codec::BitcoinCodec;
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use rand::Rng;
 use tokio::net::TcpStream;
-use tokio::time::error::Elapsed;
-use tokio::time::timeout;
+use tokio::task;
+use tokio::time::{error::Elapsed, sleep, timeout};
 use tokio_util::codec::Framed;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
-
+use futures::future::select_all;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// The address of the node to reach to.
-    /// `dig seed.bitcoin.sipa.be +short` may provide a fresh list of nodes.
-    #[arg(short, long, default_value = "47.243.121.223:8333")]
+    #[arg(long, default_value = "47.243.121.223:8333")]
     remote_address: String,
 
     /// The connection timeout, in milliseconds.
-    /// Most nodes will quickly respond. If they don't, we'll probably want to talk to other nodes instead.
-    #[arg(short, long, default_value = "300")]
+    #[arg(long, default_value = "500")]
     connection_timeout_ms: u64,
+
+    /// The maximum number of addresses to crawl.
+    #[arg(long, default_value = "5000")]
+    max_nodes: usize,
+
+    /// The maximum number of concurrent crawling threads.
+    #[arg(long, default_value = "20")]
+    concurrency_limit: usize,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
     init_tracing();
-    // Parse command-line arguments
     let args = Args::parse();
-    // Parse the remote address
-    let remote_address = args
+
+    let initial_address = args
         .remote_address
         .parse::<SocketAddr>()
         .context("Invalid remote address")?;
-    // Connect to the remote address
-    let peer_addresses = crawl_network(
-        vec![remote_address].into_iter().collect(),
+
+    let crawled_nodes = Arc::new(Mutex::new(HashSet::new()));
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let running_queue = Arc::new(Mutex::new(VecDeque::new()));
+
+    // Counter to track progress
+    let node_counter = Arc::new(AtomicUsize::new(0));
+
+    // Push the initial address into the queue
+    queue.lock().unwrap().push_back(initial_address);
+
+    // Measure the start time
+    let start_time = Instant::now();
+
+    // Crawl nodes concurrently with a limit on the number of concurrent threads
+    crawl_nodes(
+        queue,
+        running_queue,
+        Arc::clone(&crawled_nodes),
         args.connection_timeout_ms,
-    ).await?;
-    // Print the list of nodes
-    println!("\n*********The List of Nodes***********");
-    println!("Total Nodes: {}", peer_addresses.len());
-    println!("-------------------------------------");
-    println!("{:?}",peer_addresses);
+        args.max_nodes,
+        args.concurrency_limit,
+        Arc::clone(&node_counter),
+    )
+    .await;
+
+    // Measure the end time
+    let duration = start_time.elapsed();
+
+    // Print crawled addresses
+    let crawled_nodes = crawled_nodes.lock().unwrap();
+
+    // // Display Crawled addresses
+    // tracing::info!("Crawled addresses:");
+    // for (index, address) in crawled_nodes.iter().enumerate() {
+    //     if let Some(socket_addr) = address_to_socketaddr(&address) {
+    //         tracing::info!("Node #{}: {}", index + 1, socket_addr);
+    //     }
+    // }
+
+    tracing::info!(
+        "Crawling completed. Total addresses crawled: {}",
+        crawled_nodes.len()
+    );
+    // Print the elapsed time
+    tracing::info!("Time taken to crawl nodes: {:?}", duration);
+
     Ok(())
 }
 
-// Placeholder function to check if an address is IPv6
-fn is_ipv6(addr: &SocketAddr) -> bool {
-    matches!(addr.ip(), IpAddr::V6(_))
+async fn crawl_nodes(
+    queue: Arc<Mutex<VecDeque<SocketAddr>>>,
+    running_queue: Arc<Mutex<VecDeque<task::JoinHandle<()>>>>,
+    crawled_nodes: Arc<Mutex<HashSet<Address>>>,
+    connection_timeout: u64,
+    max_nodes: usize,
+    concurrency_limit: usize,
+    node_counter: Arc<AtomicUsize>,
+) {
+    while crawled_nodes.lock().unwrap().len() < max_nodes {
+        // Fill the running queue up to the concurrency limit
+        while running_queue.lock().unwrap().len() < concurrency_limit {
+            let node_to_crawl = {
+                let mut queue = queue.lock().unwrap();
+                if queue.is_empty() {
+                    break;
+                }
+                queue.pop_front()
+            };
+
+            if let Some(node) = node_to_crawl {
+                let crawled_nodes_clone = Arc::clone(&crawled_nodes);
+                let queue_clone = Arc::clone(&queue);
+                let running_queue_clone = Arc::clone(&running_queue);
+                let node_counter_clone = Arc::clone(&node_counter);
+
+                let task = task::spawn(async move {
+                    if let Ok(addresses) = crawl_node(node, connection_timeout).await {
+                        let mut crawled_nodes = crawled_nodes_clone.lock().unwrap();
+                        let mut queue = queue_clone.lock().unwrap();
+
+                        for addr in &addresses {
+                            if !crawled_nodes.contains(&addr) {
+                                if let Some(socket_addr) = address_to_socketaddr(&addr) {
+                                    queue.push_back(socket_addr);
+                                }
+                            }
+                        }
+
+                        let num_new_addresses = addresses.len();
+                        node_counter_clone.fetch_add(1, Ordering::Relaxed);
+
+                        crawled_nodes.extend(addresses.into_iter());
+                        
+                        // Print progress
+                        tracing::info!(
+                            "Progress: {} nodes crawled, {} addresses gathered.",
+                            node_counter_clone.load(Ordering::Relaxed),
+                            crawled_nodes.len()
+                        );
+                    }
+                });
+
+                running_queue.lock().unwrap().push_back(task);
+            }
+        }
+
+        // If the maximum number of nodes is reached, break the loop
+        if crawled_nodes.lock().unwrap().len() >= max_nodes {
+            break;
+        }
+
+        // Wait for at least one crawling task to complete before continuing
+        let (completed, _index, remaining_tasks) = {
+            let mut running_queue = running_queue.lock().unwrap();
+            select_all(running_queue.split_off(0)).await
+        };
+        
+        // Push the remaining tasks back into the queue
+        running_queue.lock().unwrap().extend(remaining_tasks);
+        
+        completed; // Handle the result of the completed task (if necessary)
+    }
+
+    tracing::info!("Crawling completed. Cancelling remaining tasks...");
+    // Option 1: Cancel all remaining tasks
+    while let Some(task) = running_queue.lock().unwrap().pop_front() {
+        task.abort(); // Cancel the task
+    }
+    tracing::info!("Done.");
 }
 
-// Placeholder function to check if an address is a Tor address
-fn is_tor(addr: &SocketAddr) -> bool {
-    // In a real scenario, implement your own logic to identify Tor addresses
-    // Here we're assuming some custom check, like checking domain names
-    false // Placeholder logic
+async fn crawl_node(node: SocketAddr, connection_timeout: u64) -> Result<HashSet<Address>, Error> {
+    let mut stream = connect(&node, connection_timeout).await?;
+    perform_handshake(&mut stream, node).await?;
+    let addresses = perform_get_addresses(&mut stream).await?;
+    Ok(addresses)
 }
 
 async fn connect(
     remote_address: &SocketAddr,
     connection_timeout: u64,
 ) -> Result<Framed<TcpStream, BitcoinCodec>, Error> {
-    // Connect to the remote address
     let connection = TcpStream::connect(remote_address).map_err(Error::ConnectionFailed);
-    // Set a timeout for the connection
     let stream = timeout(Duration::from_millis(connection_timeout), connection)
         .map_err(Error::ConnectionTimedOut)
         .await??;
-    // Create a framed stream
     let framed = Framed::new(stream, BitcoinCodec {});
     Ok(framed)
 }
 
-/// Perform a Bitcoin handshake as per [this protocol documentation](https://en.bitcoin.it/wiki/Protocol_documentation)
-async fn perform_handshake_getaddr(
+/// Perform a Bitcoin handshake as per the protocol documentation
+async fn perform_handshake(
     stream: &mut Framed<TcpStream, BitcoinCodec>,
-    address: SocketAddr,
-) -> Result<HashSet<SocketAddr>, Error> {
+    peer_address: SocketAddr,
+) -> Result<(), Error> {
     let version_message = RawNetworkMessage::new(
         Network::Bitcoin.magic(),
-        NetworkMessage::Version(build_version_message(&address)),
+        NetworkMessage::Version(build_version_message(&peer_address)),
     );
-    // Send the version message
+
     stream
         .send(version_message)
         .await
         .map_err(Error::SendingFailed)?;
 
-    //Process incoming messages
     while let Some(result) = stream.next().await {
         match result {
             Ok(message) => match message.payload() {
-                // Handle the version message
-                NetworkMessage::Version(remote_version) => {
-                    tracing::info!("version message received: {:?}", address);
+                NetworkMessage::Version(_) => {
                     stream
                         .send(RawNetworkMessage::new(
                             Network::Bitcoin.magic(),
@@ -116,30 +228,10 @@ async fn perform_handshake_getaddr(
                         ))
                         .await
                         .map_err(Error::SendingFailed)?;
+
+                    return Ok(());
                 }
-                // Handle the verack message
-                NetworkMessage::Verack => {
-                    tracing::info!("verack message received: {:?}", address);
-                    stream
-                        .send(RawNetworkMessage::new(
-                            Network::Bitcoin.magic(),
-                            NetworkMessage::GetAddr,
-                        ))
-                        .await
-                        .map_err(Error::SendingFailed)?;
-                }
-                // Handle the addr message
-                NetworkMessage::Addr(addresses) => {
-                    tracing::info!("addr message received: {:?}", address);
-                    let socket_addresses: HashSet<SocketAddr> = addresses
-                        .iter()
-                        .filter_map(|(_, address)| address.socket_addr().ok())
-                        .collect();
-                    return Ok(socket_addresses);
-                }
-                // Handle other messages
                 other_message => {
-                    // We're only interested in the version message right now. Keep the loop running.
                     tracing::debug!("Unsupported message: {:?}", other_message);
                 }
             },
@@ -148,105 +240,46 @@ async fn perform_handshake_getaddr(
             }
         }
     }
+
     Err(Error::ConnectionLost)
 }
 
-/// Crawl the Bitcoin network by connecting to a set of seed addresses and asking for more addresses.
-async fn crawl_network(
-    seed_addresses: HashSet<SocketAddr>,
-    connection_timeout: u64,
-) -> Result<HashSet<SocketAddr>, Error> {
+async fn perform_get_addresses(
+    stream: &mut Framed<TcpStream, BitcoinCodec>,
+) -> Result<HashSet<Address>, Error> {
+    stream
+        .send(RawNetworkMessage::new(
+            Network::Bitcoin.magic(),
+            NetworkMessage::GetAddr,
+        ))
+        .await
+        .map_err(Error::SendingFailed)?;
 
-    let max_concurrent_connections = 5000; // Increased concurrency
-    let max_peers = 5000;    // Target number of peers
-    
-    // Flag to stop crawling the network
-    let mut flag_done=false;
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_connections)); // Semaphore to limit concurrent connections
-    let mut known_addresses: HashSet<SocketAddr> = HashSet::new(); // Addresses we already know
-    let mut visited_addresses: HashSet<SocketAddr> = HashSet::new(); // Addresses we have already visited
-    let mut pending_addresses: VecDeque<HashSet<SocketAddr>> = VecDeque::new(); // Addresses we have discovered but not yet visited
-    pending_addresses.push_back(seed_addresses.clone()); // Seed addresses to start crawling
+    let mut address_set = HashSet::new();
 
-    for initial_address in seed_addresses{
-        known_addresses.insert(initial_address); // Seed addresses are known
-    }
-    
-    // Start crawling the network
-    while !pending_addresses.is_empty() {
-        // Pop the first set of addresses from the queue
-        let addresses = pending_addresses.pop_front().unwrap();
-        // Create a task for each address
-        let mut tasks = Vec::new();
-        // Visit each address
-        for addr in addresses {
-            // Skip if we have already visited this address
-            if visited_addresses.contains(&addr) {
-                continue;
-            }
-            // Mark the address as visited
-            visited_addresses.insert(addr);
-            // Clone the semaphore to pass it to the task
-            let semaphore: Arc<Semaphore> = Arc::clone(&semaphore);
-            // Create a task to connect to the address
-            let task = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
-                match timeout(Duration::from_millis(connection_timeout), connect(&addr, connection_timeout)).await {
-                    Ok(Ok(mut stream)) => {
-                        if let Ok(new_addresses) = perform_handshake_getaddr(&mut stream, addr).await {
-                            return Some((addr, new_addresses));
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(message) => match message.payload() {
+                NetworkMessage::Addr(addresses) => {
+                    for (_, addr) in addresses.iter() {
+                        if !is_ipv6_address(&addr.address) && !is_tor_address(&addr.address) {
+                            address_set.insert(addr.clone());
                         }
                     }
-                    Ok(Err(err)) => {
-                        tracing::error!("Connection to {} failed: {}", addr, err);
-                    }
-                    _ => {}
+                    return Ok(address_set);
                 }
-                None
-            });
-            tasks.push(task);
-        }
-
-        // Wait for all tasks to complete
-        let results = futures::future::join_all(tasks).await;
-        for result in results {
-            if let Ok(Some((addr, new_addresses))) = result {
-                let mut filtered_addresses = HashSet::new();
-                for new_addr in new_addresses {
-                    if is_ipv6(&new_addr) || is_tor(&new_addr) {
-                        continue; // Skip IPv6 or Tor addresses
-                    }
-                    // Add the new address to the list of known addresses
-                    if !known_addresses.contains(&new_addr) {
-                        filtered_addresses.insert(new_addr);
-                        tracing::info!("New address found: {}", new_addr);
-                        known_addresses.insert(new_addr);
-                    }
-                    // Stop crawling if we have reached the target number of peers
-                    if known_addresses.len() >= max_peers {
-                        flag_done=true;
-                        break;
-                    }
+                other_message => {
+                    tracing::debug!("Unsupported message: {:?}", other_message);
                 }
-                // Add the new addresses to the queue
-                if !filtered_addresses.is_empty() {
-                    pending_addresses.push_back(filtered_addresses);
-                }
-            } 
-            // Stop crawling if we have reached the target number of peers
-            if flag_done {
-                break;
+            },
+            Err(err) => {
+                tracing::error!("Decoding error: {}", err);
             }
         }
-        // Stop crawling if we have reached the target number of peers
-        if flag_done {
-            break;
-        }
     }
-    // Return the list of known addresses
-    Ok(known_addresses)
-}
 
+    Err(Error::ConnectionLost)
+}
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -261,23 +294,17 @@ enum Error {
 }
 
 fn build_version_message(receiver_address: &SocketAddr) -> VersionMessage {
-    /// The height of the block that the node is currently at.
-    /// We are always at the genesis block. because our implementation is not a real node.
     const START_HEIGHT: i32 = 0;
-    /// The most popular user agent. See https://bitnodes.io/nodes/
     const USER_AGENT: &str = "/Satoshi:25.0.0/";
     const SERVICES: ServiceFlags = ServiceFlags::NONE;
-    /// The address of this local node.
-    /// This address doesn't matter much as it will be ignored by the bitcoind node in most cases.
-    let sender_address: SocketAddr =
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
 
+    let sender_address = SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 0));
     let sender = Address::new(&sender_address, SERVICES);
     let timestamp = chrono::Utc::now().timestamp();
     let receiver = Address::new(&receiver_address, SERVICES);
     let nonce = rand::thread_rng().gen();
     let user_agent = USER_AGENT.to_string();
-    // Create a version message
+
     VersionMessage::new(
         SERVICES,
         timestamp,
@@ -293,21 +320,73 @@ pub fn init_tracing() {
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
-    // Set up tracing
+
     let env = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .with_env_var("RUST_LOG")
         .from_env_lossy();
-    // Set up formatting
+
     let fmt_layer = tracing_subscriber::fmt::layer()
         .compact()
         .with_file(true)
         .with_line_number(true)
         .with_thread_ids(false)
         .with_target(false);
-    // Initialize the subscriber
     tracing_subscriber::registry()
         .with(fmt_layer)
         .with(env)
         .init();
+}
+
+fn is_ipv6_address(address: &[u16; 8]) -> bool {
+    if address[0] == 0 && address[1] == 0 && address[2] == 0 && address[3] == 0 && address[4] == 0 {
+        if address[5] == 0xffff {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_tor_address(address: &[u16; 8]) -> bool {
+    address[0] == 0xfd87 && address[1] == 0xd87e && address[2] == 0xeb43
+}
+
+fn address_to_socketaddr(address: &Address) -> Option<SocketAddr> {
+    // The IP address in the `Address` struct is stored as an array of 8 `u16`s
+    // The first part of the address helps determine whether it's IPv4 or IPv6
+    let ip_address = &address.address;
+
+    // Check if the address is IPv4-mapped IPv6 (::ffff:192.168.1.1)
+    if ip_address[0] == 0
+        && ip_address[1] == 0
+        && ip_address[2] == 0
+        && ip_address[3] == 0
+        && ip_address[4] == 0
+        && ip_address[5] == 0xffff
+    {
+        // Extract the last two parts of the IPv6 address, which contain the IPv4 address
+        let ipv4_addr = Ipv4Addr::new(
+            (ip_address[6] >> 8) as u8,
+            ip_address[6] as u8,
+            (ip_address[7] >> 8) as u8,
+            ip_address[7] as u8,
+        );
+
+        Some(SocketAddr::new(IpAddr::V4(ipv4_addr), address.port))
+    } else {
+        // Otherwise, treat it as a full IPv6 address
+        let ipv6_addr = Ipv6Addr::new(
+            ip_address[0],
+            ip_address[1],
+            ip_address[2],
+            ip_address[3],
+            ip_address[4],
+            ip_address[5],
+            ip_address[6],
+            ip_address[7],
+        );
+
+        Some(SocketAddr::new(IpAddr::V6(ipv6_addr), address.port))
+    }
 }
